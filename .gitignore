@@ -1,0 +1,7 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+experiments/telegram_probe/results/*.json
+!experiments/telegram_probe/results/.gitkeep
