@@ -12,7 +12,8 @@
 python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install ./experiments/telegram_probe
+python -m pip install -r experiments/telegram_probe/requirements.lock
+python -m pip install --no-deps ./experiments/telegram_probe
 python -m unittest discover -s experiments/telegram_probe/tests -v
 ```
 
@@ -22,18 +23,19 @@ python -m unittest discover -s experiments/telegram_probe/tests -v
 py -3.12 -m venv .venv
 .venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-python -m pip install .\experiments\telegram_probe
+python -m pip install -r .\experiments\telegram_probe\requirements.lock
+python -m pip install --no-deps .\experiments\telegram_probe
 python -m unittest discover -s experiments\telegram_probe\tests -v
 ```
 
-Тесты не читают токен, не импортируют `aiogram`-адаптер и не обращаются в сеть. Версии runtime/build зависимостей закреплены в `pyproject.toml`; транзитивный lock будет выбран в OPS-001 после решения об окончательном стеке.
+Тесты не читают токен и не обращаются в сеть. `requirements.lock` фиксирует runtime-зависимости, включая транзитивные; это не выбор стека будущего приложения.
 
 ## Безопасная настройка и получение ID
 
 1. Создайте отдельного тестового бота через BotFather и добавьте его только в тестовый чат. Токен не публикуйте.
-2. Скопируйте `.env.example` в `.env`, внесите токен; `.env` игнорируется Git.
+2. Из корня репозитория выполните `cp experiments/telegram_probe/.env.example .env` (PowerShell: `Copy-Item experiments/telegram_probe/.env.example .env`) и внесите токен. Все команды ниже запускаются из **корня репозитория**; `.env` игнорируется Git.
 3. Оставьте списки ID пустыми и запустите `telegram-probe --discover-ids` (PowerShell и Unix одинаково внутри активного venv).
-4. Отправьте боту `/start` в личном чате, затем сообщение в каждом тестовом чате. Терминал покажет только `chat_id` и `user_id`, без текста. Остановите Ctrl+C.
+4. Отправьте `/start` в личном чате. В группе с Privacy Mode используйте доставляемую команду `/start@ActualBot` либо явное обращение `@ActualBot #probe`, подставив username из строки старта. Терминал покажет только `chat_id` и `user_id`, без текста. Остановите Ctrl+C.
 5. Запишите ID тестовых чатов в `PROBE_ALLOWED_CHAT_IDS`, а ID операторов — в `PROBE_OPERATOR_USER_IDS`. Затем перезапустите **без** `--discover-ids`.
 
 Discovery намеренно принимает ID из любого доставленного update, поэтому используйте отдельного бота и завершите режим сразу после сбора. Обычный режим игнорирует чаты вне allowlist; назначать может только пользователь одновременно из списка операторов и с текущим статусом администратора Telegram.
@@ -42,7 +44,7 @@ Discovery намеренно принимает ID из любого доста�
 
 ## Ручной сценарий
 
-1. Ответьте командой `/probe_assign` на сообщение каждого маленького набора участников. Боты отклоняются; назначение связано с числовым ID.
+1. Ответьте командой `/probe_assign` или `/probe_assign@ActualBot` на обычное (не пересланное) сообщение участника. Подставьте username из `getMe`; команда другому боту игнорируется. Боты отклоняются; назначение связано только с числовым ID.
 2. Отправьте `@ActualBot #probe` и `@ActualBot @probe`, подставив username, показанный при старте.
 3. Ответы используют HTML-ссылки `tg://user?id=...`, исходные `message_id` и `message_thread_id`. Имена HTML-экранируются; пояснение пользователя вообще не повторяется.
 4. Для нескольких частей установите `PROBE_CHUNK_SIZE=1` и небольшую `PROBE_CHUNK_DELAY_SECONDS`. Между частями удалите участника/закройте тему/удалите исходник согласно протоколу.

@@ -44,18 +44,23 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
     async def test_utf16_entities_and_code_are_handled(self):
         text = "@ActualBot #probe 😀"
         self.assertTrue(parse_probe(text, "ActualBot", (Entity("mention", 0, 10),)))
-        prefixed = "😀 @ActualBot #probe"
-        self.assertFalse(
-            parse_probe(prefixed, "ActualBot", (Entity("mention", 3, 10),))
-        )
+        prefixed = "  @ActualBot #probe 😀 кириллица"
+        self.assertTrue(parse_probe(prefixed, "ActualBot", (Entity("mention", 2, 10),)))
         self.assertFalse(
             parse_probe("@ActualBot #probe", "ActualBot", (Entity("code", 0, 17),))
+        )
+        self.assertTrue(
+            parse_probe(
+                "@ActualBot #probe `later explanation`",
+                "ActualBot",
+                (Entity("mention", 0, 10), Entity("code", 18, 19)),
+            )
         )
         self.assertFalse(
             parse_probe(
                 "@ActualBot #probe",
                 "ActualBot",
-                (Entity("mention", 0, 10), Entity("code", 11, 6)),
+                (Entity("mention", 0, 10), Entity("blockquote", 0, 17)),
             )
         )
 
@@ -98,6 +103,35 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
         probe.return_to_chat(-1, 3)
         self.assertNotIn(3, probe.assignments[-1])
 
+    async def test_snapshot_is_revalidated_after_return(self):
+        probe = Probe(frozenset({-1}), frozenset({1}), chunk_size=2)
+        probe.assign(-1, 1, Person(2, "First"))
+        probe.assign(-1, 1, Person(3, "Second"))
+
+        async def checking(_chat, user):
+            if user == 2:
+                probe.leave(-1, 2)
+                probe.return_to_chat(-1, 2)
+            return True
+
+        transport = Transport()
+        await probe.invoke(invocation(), "ActualBot", transport, checking)
+        self.assertNotIn("id=2", transport.calls[0]["text"])
+
+    async def test_departure_event_while_other_member_check_waits(self):
+        probe = Probe(frozenset({-1}), frozenset({1}), chunk_size=2)
+        probe.assign(-1, 1, Person(2, "First"))
+        probe.assign(-1, 1, Person(3, "Second"))
+
+        async def checking(_chat, user):
+            if user == 3:
+                probe.leave(-1, 2)
+            return True
+
+        transport = Transport()
+        await probe.invoke(invocation(), "ActualBot", transport, checking)
+        self.assertNotIn("id=2", transport.calls[0]["text"])
+
     async def test_timeout_is_uncertain_and_duplicate_update_is_not_resent(self):
         probe = Probe(frozenset({-1}), frozenset({1}))
         probe.assign(-1, 1, Person(2, "Member"))
@@ -111,6 +145,34 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
             "uncertain",
         )
         self.assertEqual(len(transport.calls), 1)
+
+    async def test_empty_and_member_check_failure_are_final(self):
+        probe = Probe(frozenset({-1}), frozenset({1}))
+        probe.assign(-1, 1, Person(2, "Member"))
+        transport = Transport()
+
+        async def absent(_chat, _user):
+            return False
+
+        self.assertEqual(
+            await probe.invoke(invocation(), "ActualBot", transport, absent), "empty"
+        )
+        self.assertEqual(transport.calls, [])
+
+        probe.assign(-1, 1, Person(2, "Member"))
+
+        async def broken(_chat, _user):
+            raise RuntimeError("membership unavailable")
+
+        failed = invocation(update=11)
+        self.assertEqual(
+            await probe.invoke(failed, "ActualBot", transport, broken),
+            "member_check_failed",
+        )
+        self.assertEqual(
+            await probe.invoke(failed, "ActualBot", transport, member),
+            "member_check_failed",
+        )
 
     async def test_forward_bot_unknown_chat_and_operator_are_rejected(self):
         probe = Probe(frozenset({-1}), frozenset({1}))
