@@ -29,6 +29,14 @@ def is_actual_member(member: Any) -> bool:
     return False
 
 
+def is_chat_administrator(member: Any) -> bool:
+    """Deny every operator status except the two Bot API admin states."""
+    return _enum_value(getattr(member, "status", "")).casefold() in {
+        "administrator",
+        "creator",
+    }
+
+
 def assignment_command(text: str | None, bot_username: str) -> bool:
     if not text:
         return False
@@ -85,6 +93,7 @@ def build_router(bot: Any, config: Config, me: Any):
 
     router = Router()
     probe = Probe(config.chats, config.operators, config.chunk_size, config.delay)
+    membership_revisions: dict[tuple[int, int], int] = {}
 
     class LiveTransport:
         async def send(
@@ -130,6 +139,8 @@ def build_router(bot: Any, config: Config, me: Any):
                     "Назначение отклонено: участник не определён или является ботом."
                 )
                 return
+            membership_key = (message.chat.id, target.id)
+            membership_revision = membership_revisions.get(membership_key, 0)
             try:
                 operator = await bot.get_chat_member(message.chat.id, sender.id)
             except Exception as exc:
@@ -139,10 +150,7 @@ def build_router(bot: Any, config: Config, me: Any):
                     message.chat.id,
                 )
                 return
-            if _enum_value(operator.status).casefold() not in {
-                "administrator",
-                "creator",
-            }:
+            if sender.id not in config.operators or not is_chat_administrator(operator):
                 await message.reply(
                     "Назначение отклонено: нужны права администратора Telegram."
                 )
@@ -162,6 +170,27 @@ def build_router(bot: Any, config: Config, me: Any):
             if not target_present:
                 await message.reply(
                     "Назначение отклонено: участник сейчас отсутствует в чате."
+                )
+                return
+            try:
+                current_operator = await bot.get_chat_member(message.chat.id, sender.id)
+            except Exception as exc:
+                logging.error(
+                    "final_operator_check_failed error_type=%s outcome=denied "
+                    "chat_id=%s update_key=%s",
+                    type(exc).__name__,
+                    message.chat.id,
+                    message.message_id,
+                )
+                return
+            if sender.id not in config.operators or not is_chat_administrator(
+                current_operator
+            ):
+                await message.reply("Назначение отклонено: права оператора изменились.")
+                return
+            if membership_revisions.get(membership_key, 0) != membership_revision:
+                await message.reply(
+                    "Назначение отклонено: членство участника изменилось."
                 )
                 return
             try:
@@ -210,9 +239,13 @@ def build_router(bot: Any, config: Config, me: Any):
         present = is_actual_member(member)
         was_present = is_actual_member(event.old_chat_member)
         if not present:
+            key = (event.chat.id, user_id)
+            membership_revisions[key] = membership_revisions.get(key, 0) + 1
             probe.leave(event.chat.id, user_id)
             action = "deactivated"
         elif not was_present:
+            key = (event.chat.id, user_id)
+            membership_revisions[key] = membership_revisions.get(key, 0) + 1
             probe.return_to_chat(event.chat.id, user_id)
             action = "assignment_not_restored"
         else:

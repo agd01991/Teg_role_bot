@@ -23,10 +23,23 @@ async def member(_chat, _user):
 
 
 def invocation(
-    text="@ActualBot #probe", *, chat=-1, author=9, update=10, thread=7, forwarded=False
+    text="@ActualBot #probe",
+    *,
+    chat=-1,
+    author=9,
+    update=10,
+    thread=7,
+    forwarded=False,
+    author_is_bot=False,
 ):
     return Invocation(
-        update, chat, 44, thread, Person(author, "Caller"), text, forwarded
+        update,
+        chat,
+        44,
+        thread,
+        Person(author, "Caller", author_is_bot),
+        text,
+        forwarded,
     )
 
 
@@ -77,6 +90,24 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("&lt;Alice &amp; Bob&gt;", transport.calls[0]["text"])
         self.assertNotIn("Elsewhere", transport.calls[0]["text"])
         self.assertNotIn("Caller</a>", transport.calls[0]["text"])
+
+    async def test_bot_author_is_ignored_before_recipient_checks(self):
+        probe = Probe(frozenset({-1}), frozenset({1}))
+        probe.assign(-1, 1, Person(2, "Recipient"))
+        transport = Transport()
+        checks = []
+
+        async def checking(chat_id, user_id):
+            checks.append((chat_id, user_id))
+            return True
+
+        result = await probe.invoke(
+            invocation(author_is_bot=True), "ActualBot", transport, checking
+        )
+        self.assertEqual(result, "ignored")
+        self.assertEqual(checks, [])
+        self.assertEqual(transport.calls, [])
+        self.assertIn(2, probe.assignments[-1])
 
     async def test_context_and_aliases_have_same_members(self):
         probe = Probe(frozenset({-1}), frozenset({1}))

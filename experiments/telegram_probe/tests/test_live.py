@@ -1,3 +1,4 @@
+import asyncio
 import io
 import logging
 import unittest
@@ -38,12 +39,15 @@ class Session(BaseSession):
         self.calls = []
         self.closed = False
         self.members = {}
+        self.request_hook = None
 
     async def close(self):
         self.closed = True
 
     async def make_request(self, bot, method, timeout=None):
         self.calls.append(method)
+        if self.request_hook:
+            await self.request_hook(method)
         if isinstance(method, GetChatMember):
             return self.members.get(
                 method.user_id,
@@ -121,12 +125,21 @@ def parsed_administrator(user_id):
     )
 
 
-def message(text, sender=1, *, reply=None, entities=None, forward=False, message_id=10):
+def message(
+    text,
+    sender=1,
+    *,
+    reply=None,
+    entities=None,
+    forward=False,
+    message_id=10,
+    sender_is_bot=False,
+):
     data = dict(
         message_id=message_id,
         date=0,
         chat=Chat(id=-100, type="supergroup", title="Test"),
-        from_user=user(sender),
+        from_user=user(sender, bot=sender_is_bot),
         text=text,
         entities=entities,
         reply_to_message=reply,
@@ -138,6 +151,16 @@ def message(text, sender=1, *, reply=None, entities=None, forward=False, message
             "date": 0,
         }
     return Message(**data)
+
+
+def membership_event(user_id, old_member, new_member, *, chat_id=-100):
+    return ChatMemberUpdated(
+        chat=Chat(id=chat_id, type="supergroup", title="Test"),
+        from_user=user(1),
+        date=0,
+        old_chat_member=old_member,
+        new_chat_member=new_member,
+    )
 
 
 class LiveTests(unittest.IsolatedAsyncioTestCase):
@@ -227,6 +250,128 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
         sent = [call for call in self.session.calls if isinstance(call, SendMessage)]
         self.assertEqual(len(sent), 1)
         self.assertIn("tg://user?id=2", sent[0].text)
+
+    async def test_bot_message_via_dispatcher_does_not_invoke_role(self):
+        self.probe.assign(-100, 1, Person(2, "Recipient"))
+        text = "@ActualBot #probe"
+        entity = MessageEntity(type="mention", offset=0, length=10)
+        await self.feed(
+            message(text, sender=8, sender_is_bot=True, entities=[entity]), 10
+        )
+        self.assertFalse(
+            any(
+                isinstance(call, (GetChatMember, SendMessage))
+                for call in self.session.calls
+            )
+        )
+        self.assertIn(2, self.probe.assignments[-100])
+
+    async def test_operator_loses_rights_while_target_check_waits(self):
+        waiting, release = asyncio.Event(), asyncio.Event()
+
+        async def hook(method):
+            if isinstance(method, GetChatMember) and method.user_id == 2:
+                waiting.set()
+                await release.wait()
+
+        self.session.request_hook = hook
+        task = asyncio.create_task(
+            self.feed(message("/probe_assign", reply=message("hello", sender=2)))
+        )
+        await waiting.wait()
+        self.session.members[1] = parsed_member(
+            {"status": "member", "user": user(1).model_dump()}
+        )
+        release.set()
+        await task
+        self.assertNotIn(2, self.probe.assignments.get(-100, {}))
+        sent = [
+            call.text for call in self.session.calls if isinstance(call, SendMessage)
+        ]
+        self.assertFalse(any("сохранено" in text for text in sent))
+
+    async def test_final_operator_check_error_is_safely_denied(self):
+        operator_checks = 0
+
+        async def hook(method):
+            nonlocal operator_checks
+            if isinstance(method, GetChatMember) and method.user_id == 1:
+                operator_checks += 1
+                if operator_checks == 2:
+                    raise RuntimeError("PRIVATE_MESSAGE_TOKEN_MARKER")
+
+        self.session.request_hook = hook
+        with self.assertLogs(level="ERROR") as captured:
+            await self.feed(message("/probe_assign", reply=message("hello", sender=2)))
+        self.assertNotIn(2, self.probe.assignments.get(-100, {}))
+        diagnostic = "\n".join(captured.output)
+        self.assertIn("final_operator_check_failed", diagnostic)
+        self.assertIn("error_type=RuntimeError", diagnostic)
+        self.assertNotIn("PRIVATE_MESSAGE_TOKEN_MARKER", diagnostic)
+        sent = [
+            call.text for call in self.session.calls if isinstance(call, SendMessage)
+        ]
+        self.assertFalse(any("сохранено" in text for text in sent))
+
+    async def _assign_while_final_check_waits(self, events):
+        waiting, release = asyncio.Event(), asyncio.Event()
+        operator_checks = 0
+
+        async def hook(method):
+            nonlocal operator_checks
+            if isinstance(method, GetChatMember) and method.user_id == 1:
+                operator_checks += 1
+                if operator_checks == 2:
+                    waiting.set()
+                    await release.wait()
+
+        self.session.request_hook = hook
+        task = asyncio.create_task(
+            self.feed(message("/probe_assign", reply=message("hello", sender=2)))
+        )
+        await waiting.wait()
+        for update_id, event in enumerate(events, 100):
+            await self.dp.feed_update(
+                self.bot, Update(update_id=update_id, chat_member=event)
+            )
+        release.set()
+        await task
+        return [
+            call.text for call in self.session.calls if isinstance(call, SendMessage)
+        ]
+
+    async def test_target_leaves_during_final_operator_check(self):
+        left = membership_event(
+            2, ChatMemberMember(user=user(2)), ChatMemberLeft(user=user(2))
+        )
+        sent = await self._assign_while_final_check_waits([left])
+        self.assertNotIn(2, self.probe.assignments.get(-100, {}))
+        self.assertFalse(any("сохранено" in text for text in sent))
+
+    async def test_target_leaves_and_returns_during_final_operator_check(self):
+        left = membership_event(
+            2, ChatMemberMember(user=user(2)), ChatMemberLeft(user=user(2))
+        )
+        returned = membership_event(
+            2, ChatMemberLeft(user=user(2)), ChatMemberMember(user=user(2))
+        )
+        sent = await self._assign_while_final_check_waits([left, returned])
+        self.assertNotIn(2, self.probe.assignments.get(-100, {}))
+        self.assertFalse(any("сохранено" in text for text in sent))
+
+    async def test_unrelated_membership_event_does_not_block_assignment(self):
+        unrelated = membership_event(
+            3, ChatMemberMember(user=user(3)), ChatMemberLeft(user=user(3))
+        )
+        other_chat = membership_event(
+            2,
+            ChatMemberMember(user=user(2)),
+            ChatMemberLeft(user=user(2)),
+            chat_id=-200,
+        )
+        sent = await self._assign_while_final_check_waits([unrelated, other_chat])
+        self.assertIn(2, self.probe.assignments[-100])
+        self.assertTrue(any("сохранено" in text for text in sent))
 
     async def test_restricted_events_and_return_do_not_restore(self):
         self.probe.assign(-100, 1, Person(2, "Recipient"))
