@@ -101,6 +101,7 @@ class Probe:
     departed: dict[int, set[int]] = field(default_factory=dict)
     processed: set[tuple[int, int]] = field(default_factory=set)
     outcomes: dict[tuple[int, int], str] = field(default_factory=dict)
+    membership_revisions: dict[tuple[int, int], int] = field(default_factory=dict)
 
     def assign(self, chat_id: int, operator_id: int, person: Person) -> None:
         self._authorize(chat_id, operator_id)
@@ -110,13 +111,22 @@ class Probe:
         self.departed.setdefault(chat_id, set()).discard(person.user_id)
 
     def leave(self, chat_id: int, user_id: int) -> None:
+        self._advance_membership(chat_id, user_id)
         self.assignments.setdefault(chat_id, {}).pop(user_id, None)
         self.departed.setdefault(chat_id, set()).add(user_id)
 
     def return_to_chat(self, chat_id: int, user_id: int) -> None:
         # Intentionally does not restore an assignment in this process-only probe.
+        self._advance_membership(chat_id, user_id)
         self.assignments.setdefault(chat_id, {}).pop(user_id, None)
         self.departed.setdefault(chat_id, set()).discard(user_id)
+
+    def membership_revision(self, chat_id: int, user_id: int) -> int:
+        return self.membership_revisions.get((chat_id, user_id), 0)
+
+    def _advance_membership(self, chat_id: int, user_id: int) -> None:
+        key = (chat_id, user_id)
+        self.membership_revisions[key] = self.membership_revisions.get(key, 0) + 1
 
     async def invoke(
         self,
