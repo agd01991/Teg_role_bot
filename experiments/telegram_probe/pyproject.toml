@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "telegram-feasibility-probe"
+version = "0.1.0"
+description = "Disposable RES-001 Telegram mechanics probe"
+requires-python = ">=3.12,<3.13"
+dependencies = ["aiogram==3.22.0"]
+
+[project.scripts]
+telegram-probe = "telegram_probe.live:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
