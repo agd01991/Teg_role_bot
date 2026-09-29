@@ -450,6 +450,30 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(2, self.probe.assignments.get(-100, {}))
         self.assertFalse(any("сохранено" in text for text in sent))
 
+    async def test_operator_membership_event_during_final_check_denies_assignment(self):
+        left = membership_event(
+            1,
+            ChatMemberAdministrator(
+                user=user(1),
+                can_be_edited=False,
+                is_anonymous=False,
+                can_manage_chat=True,
+                can_delete_messages=False,
+                can_manage_video_chats=False,
+                can_restrict_members=False,
+                can_promote_members=False,
+                can_change_info=False,
+                can_invite_users=False,
+                can_post_stories=False,
+                can_edit_stories=False,
+                can_delete_stories=False,
+            ),
+            ChatMemberLeft(user=user(1)),
+        )
+        sent = await self._assign_while_final_check_waits([left])
+        self.assertNotIn(2, self.probe.assignments.get(-100, {}))
+        self.assertFalse(any("сохранено" in text for text in sent))
+
     async def test_target_leaves_and_returns_during_final_operator_check(self):
         left = membership_event(
             2, ChatMemberMember(user=user(2)), ChatMemberLeft(user=user(2))

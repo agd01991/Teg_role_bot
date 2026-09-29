@@ -163,6 +163,10 @@ def build_router(bot: Any, config: Config, me: Any):
                     "Назначение отклонено: участник не определён или является ботом."
                 )
                 return
+            operator_membership_key = (message.chat.id, sender.id)
+            operator_membership_revision = probe.membership_revision(
+                *operator_membership_key
+            )
             membership_key = (message.chat.id, target.id)
             membership_revision = probe.membership_revision(*membership_key)
             try:
@@ -212,6 +216,14 @@ def build_router(bot: Any, config: Config, me: Any):
                 current_operator
             ):
                 await message.reply("Назначение отклонено: права оператора изменились.")
+                return
+            if (
+                probe.membership_revision(*operator_membership_key)
+                != operator_membership_revision
+            ):
+                await message.reply(
+                    "Назначение отклонено: членство оператора изменилось."
+                )
                 return
             if probe.membership_revision(*membership_key) != membership_revision:
                 await message.reply(
