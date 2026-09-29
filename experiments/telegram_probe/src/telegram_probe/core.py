@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass, field
 from html import escape
 from typing import Awaitable, Callable, Protocol
@@ -39,6 +40,7 @@ class Transport(Protocol):
 
 
 MemberCheck = Callable[[int, int], Awaitable[bool]]
+logger = logging.getLogger(__name__)
 
 
 def _utf16_slice(text: str, offset: int, length: int) -> str:
@@ -153,9 +155,11 @@ class Probe:
                     continue
                 try:
                     is_member = await member_check(invocation.chat_id, person.user_id)
-                except Exception:
+                except Exception as exc:
                     prefix = "partially_sent_" if sent_parts else ""
-                    return self._finish(key, f"{prefix}member_check_failed")
+                    outcome = f"{prefix}member_check_failed"
+                    self._log_failure("member_check", exc, outcome, key, person.user_id)
+                    return self._finish(key, outcome)
                 if not is_member:
                     self.leave(invocation.chat_id, person.user_id)
                 elif self._still_assigned(invocation.chat_id, person):
@@ -178,12 +182,16 @@ class Probe:
                     reply_to=invocation.message_id,
                     thread_id=invocation.thread_id,
                 )
-            except TimeoutError:
+            except TimeoutError as exc:
                 prefix = "partially_sent_" if sent_parts else ""
-                return self._finish(key, f"{prefix}uncertain")
-            except Exception:
+                outcome = f"{prefix}uncertain"
+                self._log_failure("send", exc, outcome, key)
+                return self._finish(key, outcome)
+            except Exception as exc:
                 prefix = "partially_sent_" if sent_parts else ""
-                return self._finish(key, f"{prefix}send_failed")
+                outcome = f"{prefix}send_failed"
+                self._log_failure("send", exc, outcome, key)
+                return self._finish(key, outcome)
             sent_parts += 1
             if index + 1 < len(chunks) and self.chunk_delay:
                 await asyncio.sleep(self.chunk_delay)
@@ -203,3 +211,24 @@ class Probe:
     def _finish(self, key: tuple[int, int], outcome: str) -> str:
         self.outcomes[key] = outcome
         return outcome
+
+    @staticmethod
+    def _log_failure(
+        stage: str,
+        exc: Exception,
+        outcome: str,
+        key: tuple[int, int],
+        user_id: int | None = None,
+    ) -> None:
+        # Do not render the exception: Telegram errors may contain response bodies,
+        # message text, or token-bearing URLs.
+        logger.error(
+            "probe_failure stage=%s error_type=%s outcome=%s chat_id=%s "
+            "update_key=%s user_id=%s",
+            stage,
+            type(exc).__name__,
+            outcome,
+            key[0],
+            key[1],
+            user_id if user_id is not None else "none",
+        )

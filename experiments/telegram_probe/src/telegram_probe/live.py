@@ -3,18 +3,25 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+from enum import Enum
 from typing import Any
 
 from .config import Config
 from .core import Entity, Invocation, Person, Probe
 
 _MEMBER_STATUSES = {"creator", "administrator", "member"}
-_ABSENT_STATUSES = {"left", "kicked"}
+
+
+def _enum_value(value: Any) -> str:
+    """Return an API value for both parsed strings and aiogram enums."""
+    if isinstance(value, Enum):
+        value = value.value
+    return value if isinstance(value, str) else ""
 
 
 def is_actual_member(member: Any) -> bool:
     """Interpret Bot API membership consistently and deny unknown states."""
-    status = str(getattr(member, "status", ""))
+    status = _enum_value(getattr(member, "status", "")).casefold()
     if status in _MEMBER_STATUSES:
         return True
     if status == "restricted":
@@ -37,12 +44,28 @@ class FrameworkLogFilter(logging.Filter):
 
     def filter(self, record: logging.LogRecord) -> bool:
         if record.name == "aiogram" or record.name.startswith("aiogram."):
-            error_type = record.exc_info[0].__name__ if record.exc_info else "none"
-            record.msg = "aiogram event failed error_type=%s"
-            record.args = (error_type,)
+            if record.levelno < logging.ERROR:
+                record.msg = "aiogram event info"
+                record.args = ()
+            else:
+                error_type = self._error_type(record)
+                record.msg = "aiogram event failed error_type=%s"
+                record.args = (error_type,)
             record.exc_info = None
             record.exc_text = None
         return True
+
+    @staticmethod
+    def _error_type(record: logging.LogRecord) -> str:
+        if record.exc_info:
+            exc_type = record.exc_info[0]
+            if exc_type is not None:
+                return exc_type.__name__
+        args = record.args if isinstance(record.args, tuple) else (record.args,)
+        for arg in args:
+            if isinstance(arg, BaseException):
+                return type(arg).__name__
+        return "unknown"
 
 
 def configure_logging(level: int = logging.INFO) -> None:
@@ -56,7 +79,7 @@ def configure_logging(level: int = logging.INFO) -> None:
 
 def build_router(bot: Any, config: Config, me: Any):
     from aiogram import Router
-    from aiogram.enums import ChatMemberStatus, ParseMode
+    from aiogram.enums import ParseMode
     from aiogram.exceptions import TelegramNetworkError
     from aiogram.types import Message, ReplyParameters
 
@@ -116,12 +139,29 @@ def build_router(bot: Any, config: Config, me: Any):
                     message.chat.id,
                 )
                 return
-            if str(operator.status) not in {
-                str(ChatMemberStatus.ADMINISTRATOR),
-                str(ChatMemberStatus.CREATOR),
+            if _enum_value(operator.status).casefold() not in {
+                "administrator",
+                "creator",
             }:
                 await message.reply(
                     "Назначение отклонено: нужны права администратора Telegram."
+                )
+                return
+            try:
+                target_present = await member_check(message.chat.id, target.id)
+            except Exception as exc:
+                logging.error(
+                    "target_member_check_failed error_type=%s outcome=denied "
+                    "chat_id=%s user_id=%s update_key=%s",
+                    type(exc).__name__,
+                    message.chat.id,
+                    target.id,
+                    message.message_id,
+                )
+                return
+            if not target_present:
+                await message.reply(
+                    "Назначение отклонено: участник сейчас отсутствует в чате."
                 )
                 return
             try:
@@ -147,7 +187,7 @@ def build_router(bot: Any, config: Config, me: Any):
             message.text,
             is_forwarded=message.forward_origin is not None,
             entities=tuple(
-                Entity(str(entity.type), entity.offset, entity.length)
+                Entity(_enum_value(entity.type), entity.offset, entity.length)
                 for entity in (message.entities or ())
             ),
         )
@@ -163,20 +203,27 @@ def build_router(bot: Any, config: Config, me: Any):
 
     @router.chat_member()
     async def membership(event: Any) -> None:
+        if event.chat.id not in config.chats:
+            return
         member = event.new_chat_member
         user_id = member.user.id
         present = is_actual_member(member)
+        was_present = is_actual_member(event.old_chat_member)
         if not present:
             probe.leave(event.chat.id, user_id)
-        elif str(event.old_chat_member.status) in _ABSENT_STATUSES:
+            action = "deactivated"
+        elif not was_present:
             probe.return_to_chat(event.chat.id, user_id)
+            action = "assignment_not_restored"
+        else:
+            action = "kept"
         logging.info(
             "membership_event chat_id=%s user_id=%s status=%s is_member=%s action=%s",
             event.chat.id,
             user_id,
-            member.status,
+            _enum_value(member.status),
             getattr(member, "is_member", None),
-            "kept" if present else "deactivated",
+            action,
         )
 
     return router, probe
