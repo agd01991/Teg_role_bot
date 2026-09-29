@@ -10,6 +10,7 @@ from aiogram.methods import GetChatMember, SendMessage
 from aiogram.types import (
     Chat,
     ChatMemberAdministrator,
+    ChatMemberOwner,
     ChatMemberLeft,
     ChatMemberMember,
     ChatMemberRestricted,
@@ -91,6 +92,35 @@ def restricted_member(user_id, is_member):
     )
 
 
+def parsed_member(data):
+    """Build a member as aiogram does after a JSON Bot API response."""
+    from aiogram.types import ChatMemberUnion
+    from pydantic import TypeAdapter
+
+    return TypeAdapter(ChatMemberUnion).validate_python(data)
+
+
+def parsed_administrator(user_id):
+    return parsed_member(
+        {
+            "status": "administrator",
+            "user": user(user_id).model_dump(),
+            "can_be_edited": False,
+            "is_anonymous": False,
+            "can_manage_chat": True,
+            "can_delete_messages": False,
+            "can_manage_video_chats": False,
+            "can_restrict_members": False,
+            "can_promote_members": False,
+            "can_change_info": False,
+            "can_invite_users": False,
+            "can_post_stories": False,
+            "can_edit_stories": False,
+            "can_delete_stories": False,
+        }
+    )
+
+
 def message(text, sender=1, *, reply=None, entities=None, forward=False, message_id=10):
     data = dict(
         message_id=message_id,
@@ -119,21 +149,7 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
         router, self.probe = build_router(self.bot, self.config, me)
         self.dp = Dispatcher()
         self.dp.include_router(router)
-        self.session.members[1] = ChatMemberAdministrator(
-            user=user(1),
-            can_be_edited=False,
-            is_anonymous=False,
-            can_manage_chat=True,
-            can_delete_messages=False,
-            can_manage_video_chats=False,
-            can_restrict_members=False,
-            can_promote_members=False,
-            can_change_info=False,
-            can_invite_users=False,
-            can_post_stories=False,
-            can_edit_stories=False,
-            can_delete_stories=False,
-        )
+        self.session.members[1] = parsed_administrator(1)
 
     async def asyncTearDown(self):
         await self.bot.session.close()
@@ -151,6 +167,49 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
         target3 = message("hello", sender=4, message_id=7)
         await self.feed(message("/probe_assign@OtherBot", reply=target3), 3)
         self.assertNotIn(4, self.probe.assignments[-100])
+
+    async def test_owner_and_administrator_from_json_can_assign(self):
+        target = message("hello", sender=2, message_id=9)
+        await self.feed(message("/probe_assign", reply=target), 1)
+        self.assertIn(2, self.probe.assignments[-100])
+
+        self.session.members[1] = parsed_member(
+            {
+                "status": "creator",
+                "user": user(1).model_dump(),
+                "is_anonymous": False,
+            }
+        )
+        target = message("hello", sender=3, message_id=8)
+        await self.feed(message("/probe_assign", reply=target), 2)
+        self.assertIn(3, self.probe.assignments[-100])
+
+    async def test_regular_member_cannot_assign(self):
+        self.session.members[1] = parsed_member(
+            {"status": "member", "user": user(1).model_dump()}
+        )
+        await self.feed(message("/probe_assign", reply=message("hello", sender=2)), 1)
+        self.assertNotIn(2, self.probe.assignments.get(-100, {}))
+
+    async def test_absent_or_unverified_target_cannot_be_assigned(self):
+        target = message("hello", sender=2)
+        self.session.members[2] = parsed_member(
+            {"status": "left", "user": user(2).model_dump()}
+        )
+        await self.feed(message("/probe_assign", reply=target), 1)
+        self.assertNotIn(2, self.probe.assignments.get(-100, {}))
+
+        self.session.members[2] = RuntimeError("PRIVATE_MESSAGE_MARKER")
+        original = self.session.make_request
+
+        async def failing(bot, method, timeout=None):
+            if isinstance(method, GetChatMember) and method.user_id == 2:
+                raise self.session.members[2]
+            return await original(bot, method, timeout)
+
+        self.session.make_request = failing
+        await self.feed(message("/probe_assign", reply=target), 2)
+        self.assertNotIn(2, self.probe.assignments.get(-100, {}))
 
     async def test_forwarded_command_and_target_are_rejected(self):
         target = message("hello", sender=2)
@@ -201,12 +260,66 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
         await self.dp.feed_update(self.bot, Update(update_id=22, chat_member=returned))
         self.assertNotIn(2, self.probe.assignments[-100])
 
+    async def test_restricted_absent_to_present_drops_old_assignment(self):
+        self.probe.assign(-100, 1, Person(2, "Recipient"))
+        event = ChatMemberUpdated(
+            chat=Chat(id=-100, type="supergroup", title="Test"),
+            from_user=user(1),
+            date=0,
+            old_chat_member=restricted_member(2, False),
+            new_chat_member=restricted_member(2, True),
+        )
+        with self.assertLogs(level="INFO") as captured:
+            await self.dp.feed_update(self.bot, Update(update_id=23, chat_member=event))
+        self.assertNotIn(2, self.probe.assignments[-100])
+        self.assertTrue(
+            any("action=assignment_not_restored" in line for line in captured.output)
+        )
+
+    async def test_foreign_chat_membership_event_is_ignored(self):
+        event = ChatMemberUpdated(
+            chat=Chat(id=-200, type="supergroup", title="Other"),
+            from_user=user(1),
+            date=0,
+            old_chat_member=ChatMemberMember(user=user(2)),
+            new_chat_member=ChatMemberLeft(user=user(2)),
+        )
+        await self.dp.feed_update(self.bot, Update(update_id=24, chat_member=event))
+        self.assertNotIn(-200, self.probe.assignments)
+        self.assertNotIn(-200, self.probe.departed)
+
 
 class MembershipAndSafetyTests(unittest.IsolatedAsyncioTestCase):
     def test_restricted_membership(self):
         yes = restricted_member(2, True)
         self.assertTrue(is_actual_member(yes))
         self.assertFalse(is_actual_member(yes.model_copy(update={"is_member": False})))
+
+    def test_string_and_enum_membership_statuses(self):
+        members = [
+            ChatMemberOwner(user=user(2), is_anonymous=False),
+            ChatMemberAdministrator(
+                user=user(2),
+                can_be_edited=False,
+                is_anonymous=False,
+                can_manage_chat=True,
+                can_delete_messages=False,
+                can_manage_video_chats=False,
+                can_restrict_members=False,
+                can_promote_members=False,
+                can_change_info=False,
+                can_invite_users=False,
+                can_post_stories=False,
+                can_edit_stories=False,
+                can_delete_stories=False,
+            ),
+            ChatMemberMember(user=user(2)),
+            parsed_member({"status": "member", "user": user(2).model_dump()}),
+        ]
+        self.assertTrue(all(is_actual_member(member) for member in members))
+        for status in ("left", "kicked", "future_status"):
+            member = type("Member", (), {"status": status})()
+            self.assertFalse(is_actual_member(member))
 
     def test_command_parser(self):
         self.assertTrue(assignment_command("/probe_assign", "ActualBot"))
@@ -220,16 +333,56 @@ class MembershipAndSafetyTests(unittest.IsolatedAsyncioTestCase):
         handler = logging.StreamHandler(stream)
         handler.addFilter(FrameworkLogFilter())
         logger = logging.getLogger("aiogram.dispatcher")
+        old_handlers, old_level, old_propagate = (
+            logger.handlers[:],
+            logger.level,
+            logger.propagate,
+        )
         logger.handlers[:] = [handler]
+        logger.setLevel(logging.INFO)
         logger.propagate = False
         try:
-            raise ClientDecodeError("decode failed", ValueError("bad"), marker + token)
-        except ClientDecodeError:
-            logger.exception("update=%s", marker)
+            try:
+                raise ClientDecodeError(
+                    "decode failed", ValueError("bad"), marker + token
+                )
+            except ClientDecodeError:
+                logger.exception("update=%s", marker)
+        finally:
+            logger.handlers[:] = old_handlers
+            logger.setLevel(old_level)
+            logger.propagate = old_propagate
         output = stream.getvalue()
         self.assertIn("ClientDecodeError", output)
         self.assertNotIn(marker, output)
         self.assertNotIn(token, output)
+
+    def test_framework_info_and_error_without_exc_info_are_safe(self):
+        marker = "PRIVATE_MESSAGE_MARKER"
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.addFilter(FrameworkLogFilter())
+        logger = logging.getLogger("aiogram.dispatcher")
+        old_handlers, old_level, old_propagate = (
+            logger.handlers[:],
+            logger.level,
+            logger.propagate,
+        )
+        logger.handlers[:] = [handler]
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        try:
+            logger.info("Start polling %s", marker)
+            logger.error("Polling failed: %s", RuntimeError(marker))
+        finally:
+            logger.handlers[:] = old_handlers
+            logger.setLevel(old_level)
+            logger.propagate = old_propagate
+        output = stream.getvalue()
+        self.assertIn("aiogram event info", output)
+        self.assertIn("error_type=RuntimeError", output)
+        self.assertNotIn("event failed error_type=none", output)
+        self.assertNotIn(marker, output)
 
     async def test_session_closes_on_preflight_failure(self):
         fake_bot = AsyncMock()

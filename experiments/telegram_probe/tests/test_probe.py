@@ -1,4 +1,5 @@
 import unittest
+import logging
 
 from telegram_probe.core import Entity, Invocation, Person, Probe, mention, parse_probe
 
@@ -165,14 +166,52 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
             raise RuntimeError("membership unavailable")
 
         failed = invocation(update=11)
-        self.assertEqual(
-            await probe.invoke(failed, "ActualBot", transport, broken),
-            "member_check_failed",
-        )
+        with self.assertLogs("telegram_probe.core", level="ERROR") as captured:
+            self.assertEqual(
+                await probe.invoke(failed, "ActualBot", transport, broken),
+                "member_check_failed",
+            )
+        diagnostic = "\n".join(captured.output)
+        self.assertIn("stage=member_check", diagnostic)
+        self.assertIn("error_type=RuntimeError", diagnostic)
+        self.assertIn("outcome=member_check_failed", diagnostic)
+        self.assertIn("chat_id=-1", diagnostic)
+        self.assertIn("update_key=11", diagnostic)
+        self.assertNotIn("membership unavailable", diagnostic)
         self.assertEqual(
             await probe.invoke(failed, "ActualBot", transport, member),
             "member_check_failed",
         )
+
+    async def test_send_failure_diagnostics_distinguish_failed_and_uncertain(self):
+        class BrokenTransport:
+            def __init__(self, error):
+                self.error = error
+
+            async def send(self, **_kwargs):
+                raise self.error
+
+        for update, error, outcome in (
+            (20, RuntimeError("PRIVATE_MESSAGE_MARKER"), "send_failed"),
+            (21, TimeoutError("PRIVATE_TOKEN_MARKER"), "uncertain"),
+        ):
+            probe = Probe(frozenset({-1}), frozenset({1}))
+            probe.assign(-1, 1, Person(2, "Member"))
+            with self.assertLogs("telegram_probe.core", level=logging.ERROR) as logs:
+                self.assertEqual(
+                    await probe.invoke(
+                        invocation(update=update),
+                        "ActualBot",
+                        BrokenTransport(error),
+                        member,
+                    ),
+                    outcome,
+                )
+            diagnostic = "\n".join(logs.output)
+            self.assertIn("stage=send", diagnostic)
+            self.assertIn(f"error_type={type(error).__name__}", diagnostic)
+            self.assertIn(f"outcome={outcome}", diagnostic)
+            self.assertNotIn("PRIVATE_", diagnostic)
 
     async def test_forward_bot_unknown_chat_and_operator_are_rejected(self):
         probe = Probe(frozenset({-1}), frozenset({1}))
