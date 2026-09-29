@@ -1,4 +1,5 @@
 import unittest
+import logging
 
 from telegram_probe.core import Entity, Invocation, Person, Probe, mention, parse_probe
 
@@ -22,10 +23,23 @@ async def member(_chat, _user):
 
 
 def invocation(
-    text="@ActualBot #probe", *, chat=-1, author=9, update=10, thread=7, forwarded=False
+    text="@ActualBot #probe",
+    *,
+    chat=-1,
+    author=9,
+    update=10,
+    thread=7,
+    forwarded=False,
+    author_is_bot=False,
 ):
     return Invocation(
-        update, chat, 44, thread, Person(author, "Caller"), text, forwarded
+        update,
+        chat,
+        44,
+        thread,
+        Person(author, "Caller", author_is_bot),
+        text,
+        forwarded,
     )
 
 
@@ -44,18 +58,23 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
     async def test_utf16_entities_and_code_are_handled(self):
         text = "@ActualBot #probe 😀"
         self.assertTrue(parse_probe(text, "ActualBot", (Entity("mention", 0, 10),)))
-        prefixed = "😀 @ActualBot #probe"
-        self.assertFalse(
-            parse_probe(prefixed, "ActualBot", (Entity("mention", 3, 10),))
-        )
+        prefixed = "  @ActualBot #probe 😀 кириллица"
+        self.assertTrue(parse_probe(prefixed, "ActualBot", (Entity("mention", 2, 10),)))
         self.assertFalse(
             parse_probe("@ActualBot #probe", "ActualBot", (Entity("code", 0, 17),))
+        )
+        self.assertTrue(
+            parse_probe(
+                "@ActualBot #probe `later explanation`",
+                "ActualBot",
+                (Entity("mention", 0, 10), Entity("code", 18, 19)),
+            )
         )
         self.assertFalse(
             parse_probe(
                 "@ActualBot #probe",
                 "ActualBot",
-                (Entity("mention", 0, 10), Entity("code", 11, 6)),
+                (Entity("mention", 0, 10), Entity("blockquote", 0, 17)),
             )
         )
 
@@ -71,6 +90,24 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("&lt;Alice &amp; Bob&gt;", transport.calls[0]["text"])
         self.assertNotIn("Elsewhere", transport.calls[0]["text"])
         self.assertNotIn("Caller</a>", transport.calls[0]["text"])
+
+    async def test_bot_author_is_ignored_before_recipient_checks(self):
+        probe = Probe(frozenset({-1}), frozenset({1}))
+        probe.assign(-1, 1, Person(2, "Recipient"))
+        transport = Transport()
+        checks = []
+
+        async def checking(chat_id, user_id):
+            checks.append((chat_id, user_id))
+            return True
+
+        result = await probe.invoke(
+            invocation(author_is_bot=True), "ActualBot", transport, checking
+        )
+        self.assertEqual(result, "ignored")
+        self.assertEqual(checks, [])
+        self.assertEqual(transport.calls, [])
+        self.assertIn(2, probe.assignments[-1])
 
     async def test_context_and_aliases_have_same_members(self):
         probe = Probe(frozenset({-1}), frozenset({1}))
@@ -98,6 +135,35 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
         probe.return_to_chat(-1, 3)
         self.assertNotIn(3, probe.assignments[-1])
 
+    async def test_snapshot_is_revalidated_after_return(self):
+        probe = Probe(frozenset({-1}), frozenset({1}), chunk_size=2)
+        probe.assign(-1, 1, Person(2, "First"))
+        probe.assign(-1, 1, Person(3, "Second"))
+
+        async def checking(_chat, user):
+            if user == 2:
+                probe.leave(-1, 2)
+                probe.return_to_chat(-1, 2)
+            return True
+
+        transport = Transport()
+        await probe.invoke(invocation(), "ActualBot", transport, checking)
+        self.assertNotIn("id=2", transport.calls[0]["text"])
+
+    async def test_departure_event_while_other_member_check_waits(self):
+        probe = Probe(frozenset({-1}), frozenset({1}), chunk_size=2)
+        probe.assign(-1, 1, Person(2, "First"))
+        probe.assign(-1, 1, Person(3, "Second"))
+
+        async def checking(_chat, user):
+            if user == 3:
+                probe.leave(-1, 2)
+            return True
+
+        transport = Transport()
+        await probe.invoke(invocation(), "ActualBot", transport, checking)
+        self.assertNotIn("id=2", transport.calls[0]["text"])
+
     async def test_timeout_is_uncertain_and_duplicate_update_is_not_resent(self):
         probe = Probe(frozenset({-1}), frozenset({1}))
         probe.assign(-1, 1, Person(2, "Member"))
@@ -111,6 +177,72 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
             "uncertain",
         )
         self.assertEqual(len(transport.calls), 1)
+
+    async def test_empty_and_member_check_failure_are_final(self):
+        probe = Probe(frozenset({-1}), frozenset({1}))
+        probe.assign(-1, 1, Person(2, "Member"))
+        transport = Transport()
+
+        async def absent(_chat, _user):
+            return False
+
+        self.assertEqual(
+            await probe.invoke(invocation(), "ActualBot", transport, absent), "empty"
+        )
+        self.assertEqual(transport.calls, [])
+
+        probe.assign(-1, 1, Person(2, "Member"))
+
+        async def broken(_chat, _user):
+            raise RuntimeError("membership unavailable")
+
+        failed = invocation(update=11)
+        with self.assertLogs("telegram_probe.core", level="ERROR") as captured:
+            self.assertEqual(
+                await probe.invoke(failed, "ActualBot", transport, broken),
+                "member_check_failed",
+            )
+        diagnostic = "\n".join(captured.output)
+        self.assertIn("stage=member_check", diagnostic)
+        self.assertIn("error_type=RuntimeError", diagnostic)
+        self.assertIn("outcome=member_check_failed", diagnostic)
+        self.assertIn("chat_id=-1", diagnostic)
+        self.assertIn("update_key=11", diagnostic)
+        self.assertNotIn("membership unavailable", diagnostic)
+        self.assertEqual(
+            await probe.invoke(failed, "ActualBot", transport, member),
+            "member_check_failed",
+        )
+
+    async def test_send_failure_diagnostics_distinguish_failed_and_uncertain(self):
+        class BrokenTransport:
+            def __init__(self, error):
+                self.error = error
+
+            async def send(self, **_kwargs):
+                raise self.error
+
+        for update, error, outcome in (
+            (20, RuntimeError("PRIVATE_MESSAGE_MARKER"), "send_failed"),
+            (21, TimeoutError("PRIVATE_TOKEN_MARKER"), "uncertain"),
+        ):
+            probe = Probe(frozenset({-1}), frozenset({1}))
+            probe.assign(-1, 1, Person(2, "Member"))
+            with self.assertLogs("telegram_probe.core", level=logging.ERROR) as logs:
+                self.assertEqual(
+                    await probe.invoke(
+                        invocation(update=update),
+                        "ActualBot",
+                        BrokenTransport(error),
+                        member,
+                    ),
+                    outcome,
+                )
+            diagnostic = "\n".join(logs.output)
+            self.assertIn("stage=send", diagnostic)
+            self.assertIn(f"error_type={type(error).__name__}", diagnostic)
+            self.assertIn(f"outcome={outcome}", diagnostic)
+            self.assertNotIn("PRIVATE_", diagnostic)
 
     async def test_forward_bot_unknown_chat_and_operator_are_rejected(self):
         probe = Probe(frozenset({-1}), frozenset({1}))

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass, field
 from html import escape
 from typing import Awaitable, Callable, Protocol
@@ -39,6 +40,7 @@ class Transport(Protocol):
 
 
 MemberCheck = Callable[[int, int], Awaitable[bool]]
+logger = logging.getLogger(__name__)
 
 
 def _utf16_slice(text: str, offset: int, length: int) -> str:
@@ -49,31 +51,40 @@ def _utf16_slice(text: str, offset: int, length: int) -> str:
 def parse_probe(
     text: str, bot_username: str, entities: tuple[Entity, ...] = ()
 ) -> bool:
-    """Accept only a leading bot mention followed by #probe or @probe."""
-    meaningful = {
-        entity
-        for entity in entities
-        if entity.kind
-        in {"mention", "code", "pre", "blockquote", "expandable_blockquote"}
-    }
-    if meaningful:
-        if any(
-            entity.kind in {"code", "pre", "blockquote", "expandable_blockquote"}
-            for entity in meaningful
-        ):
-            return False
-        leading = min(meaningful, key=lambda entity: entity.offset)
-        if leading.kind != "mention" or leading.offset != 0:
-            return False
-        if (
-            _utf16_slice(text, leading.offset, leading.length).casefold()
-            != f"@{bot_username}".casefold()
-        ):
-            return False
-    words = text.strip().split()
+    """Accept a first-significant bot mention and an immediately following role."""
+    stripped = text.lstrip()
+    leading_chars = len(text) - len(stripped)
+    words = stripped.split()
     if len(words) < 2 or words[0].casefold() != f"@{bot_username}".casefold():
         return False
-    return words[1].casefold().rstrip(",") in {"#probe", "@probe"}
+    role = words[1].rstrip(",")
+    if role.casefold() not in {"#probe", "@probe"}:
+        return False
+
+    prefix = text[:leading_chars]
+    mention_offset = len(prefix.encode("utf-16-le")) // 2
+    mention_length = len(words[0].encode("utf-16-le")) // 2
+    role_start_chars = text.find(words[1], leading_chars + len(words[0]))
+    control_end = len(text[: role_start_chars + len(words[1])].encode("utf-16-le")) // 2
+    if entities:
+        mentions = [entity for entity in entities if entity.kind == "mention"]
+        if not any(
+            entity.offset == mention_offset
+            and entity.length == mention_length
+            and _utf16_slice(text, entity.offset, entity.length).casefold()
+            == f"@{bot_username}".casefold()
+            for entity in mentions
+        ):
+            return False
+        forbidden = {"code", "pre", "blockquote", "expandable_blockquote"}
+        if any(
+            entity.kind in forbidden
+            and entity.offset < control_end
+            and entity.offset + entity.length > mention_offset
+            for entity in entities
+        ):
+            return False
+    return True
 
 
 def mention(person: Person) -> str:
@@ -99,6 +110,7 @@ class Probe:
         self.departed.setdefault(chat_id, set()).discard(person.user_id)
 
     def leave(self, chat_id: int, user_id: int) -> None:
+        self.assignments.setdefault(chat_id, {}).pop(user_id, None)
         self.departed.setdefault(chat_id, set()).add(user_id)
 
     def return_to_chat(self, chat_id: int, user_id: int) -> None:
@@ -135,12 +147,28 @@ class Probe:
             recipients[i : i + self.chunk_size]
             for i in range(0, len(recipients), self.chunk_size)
         ]
+        sent_parts = 0
         for index, chunk in enumerate(chunks):
+            eligible = []
+            for person in chunk:
+                if not self._still_assigned(invocation.chat_id, person):
+                    continue
+                try:
+                    is_member = await member_check(invocation.chat_id, person.user_id)
+                except Exception as exc:
+                    prefix = "partially_sent_" if sent_parts else ""
+                    outcome = f"{prefix}member_check_failed"
+                    self._log_failure("member_check", exc, outcome, key, person.user_id)
+                    return self._finish(key, outcome)
+                if not is_member:
+                    self.leave(invocation.chat_id, person.user_id)
+                elif self._still_assigned(invocation.chat_id, person):
+                    eligible.append(person)
+            # A chat_member update may have arrived while a later member was checked.
             eligible = [
                 person
-                for person in chunk
-                if person.user_id not in self.departed.get(invocation.chat_id, set())
-                and await member_check(invocation.chat_id, person.user_id)
+                for person in eligible
+                if self._still_assigned(invocation.chat_id, person)
             ]
             if not eligible:
                 continue
@@ -154,14 +182,25 @@ class Probe:
                     reply_to=invocation.message_id,
                     thread_id=invocation.thread_id,
                 )
-            except TimeoutError:
-                return self._finish(key, "uncertain")
-            except Exception:
-                self._finish(key, "failed")
-                raise
+            except TimeoutError as exc:
+                prefix = "partially_sent_" if sent_parts else ""
+                outcome = f"{prefix}uncertain"
+                self._log_failure("send", exc, outcome, key)
+                return self._finish(key, outcome)
+            except Exception as exc:
+                prefix = "partially_sent_" if sent_parts else ""
+                outcome = f"{prefix}send_failed"
+                self._log_failure("send", exc, outcome, key)
+                return self._finish(key, outcome)
+            sent_parts += 1
             if index + 1 < len(chunks) and self.chunk_delay:
                 await asyncio.sleep(self.chunk_delay)
-        return self._finish(key, "sent" if chunks else "empty")
+        return self._finish(key, "sent" if sent_parts else "empty")
+
+    def _still_assigned(self, chat_id: int, person: Person) -> bool:
+        return self.assignments.get(chat_id, {}).get(
+            person.user_id
+        ) == person and person.user_id not in self.departed.get(chat_id, set())
 
     def _authorize(self, chat_id: int, operator_id: int) -> None:
         if chat_id not in self.allowed_chats:
@@ -172,3 +211,24 @@ class Probe:
     def _finish(self, key: tuple[int, int], outcome: str) -> str:
         self.outcomes[key] = outcome
         return outcome
+
+    @staticmethod
+    def _log_failure(
+        stage: str,
+        exc: Exception,
+        outcome: str,
+        key: tuple[int, int],
+        user_id: int | None = None,
+    ) -> None:
+        # Do not render the exception: Telegram errors may contain response bodies,
+        # message text, or token-bearing URLs.
+        logger.error(
+            "probe_failure stage=%s error_type=%s outcome=%s chat_id=%s "
+            "update_key=%s user_id=%s",
+            stage,
+            type(exc).__name__,
+            outcome,
+            key[0],
+            key[1],
+            user_id if user_id is not None else "none",
+        )
