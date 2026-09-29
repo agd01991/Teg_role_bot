@@ -37,14 +37,35 @@ def is_chat_administrator(member: Any) -> bool:
     }
 
 
-def assignment_command(text: str | None, bot_username: str) -> bool:
+def assignment_command(
+    text: str | None, bot_username: str, entities: tuple[Entity, ...] = ()
+) -> bool:
     if not text:
         return False
-    command = text.strip().casefold()
-    return command in {
+    stripped = text.strip()
+    command = stripped.casefold()
+    if command not in {
         "/probe_assign",
         f"/probe_assign@{bot_username}".casefold(),
-    }
+    }:
+        return False
+
+    leading_chars = len(text) - len(text.lstrip())
+    offset = len(text[:leading_chars].encode("utf-16-le")) // 2
+    length = len(stripped.encode("utf-16-le")) // 2
+    command_entities = [entity for entity in entities if entity.kind == "bot_command"]
+    if not any(
+        entity.offset == offset and entity.length == length
+        for entity in command_entities
+    ):
+        return False
+    forbidden = {"code", "pre", "blockquote", "expandable_blockquote"}
+    return not any(
+        entity.kind in forbidden
+        and entity.offset < offset + length
+        and entity.offset + entity.length > offset
+        for entity in entities
+    )
 
 
 class FrameworkLogFilter(logging.Filter):
@@ -93,7 +114,6 @@ def build_router(bot: Any, config: Config, me: Any):
 
     router = Router()
     probe = Probe(config.chats, config.operators, config.chunk_size, config.delay)
-    membership_revisions: dict[tuple[int, int], int] = {}
 
     class LiveTransport:
         async def send(
@@ -121,7 +141,11 @@ def build_router(bot: Any, config: Config, me: Any):
         sender = message.from_user
         if not sender or sender.is_bot or message.chat.id not in config.chats:
             return
-        if assignment_command(message.text, me.username):
+        entities = tuple(
+            Entity(_enum_value(entity.type), entity.offset, entity.length)
+            for entity in (message.entities or ())
+        )
+        if assignment_command(message.text, me.username, entities):
             target_message = message.reply_to_message
             if message.forward_origin is not None or not target_message:
                 await message.reply(
@@ -140,7 +164,7 @@ def build_router(bot: Any, config: Config, me: Any):
                 )
                 return
             membership_key = (message.chat.id, target.id)
-            membership_revision = membership_revisions.get(membership_key, 0)
+            membership_revision = probe.membership_revision(*membership_key)
             try:
                 operator = await bot.get_chat_member(message.chat.id, sender.id)
             except Exception as exc:
@@ -168,6 +192,7 @@ def build_router(bot: Any, config: Config, me: Any):
                 )
                 return
             if not target_present:
+                probe.leave(message.chat.id, target.id)
                 await message.reply(
                     "Назначение отклонено: участник сейчас отсутствует в чате."
                 )
@@ -188,7 +213,7 @@ def build_router(bot: Any, config: Config, me: Any):
             ):
                 await message.reply("Назначение отклонено: права оператора изменились.")
                 return
-            if membership_revisions.get(membership_key, 0) != membership_revision:
+            if probe.membership_revision(*membership_key) != membership_revision:
                 await message.reply(
                     "Назначение отклонено: членство участника изменилось."
                 )
@@ -215,10 +240,7 @@ def build_router(bot: Any, config: Config, me: Any):
             Person(sender.id, sender.full_name, sender.is_bot),
             message.text,
             is_forwarded=message.forward_origin is not None,
-            entities=tuple(
-                Entity(_enum_value(entity.type), entity.offset, entity.length)
-                for entity in (message.entities or ())
-            ),
+            entities=entities,
         )
         outcome = await probe.invoke(
             invocation, me.username, LiveTransport(), member_check
@@ -239,13 +261,9 @@ def build_router(bot: Any, config: Config, me: Any):
         present = is_actual_member(member)
         was_present = is_actual_member(event.old_chat_member)
         if not present:
-            key = (event.chat.id, user_id)
-            membership_revisions[key] = membership_revisions.get(key, 0) + 1
             probe.leave(event.chat.id, user_id)
             action = "deactivated"
         elif not was_present:
-            key = (event.chat.id, user_id)
-            membership_revisions[key] = membership_revisions.get(key, 0) + 1
             probe.return_to_chat(event.chat.id, user_id)
             action = "assignment_not_restored"
         else:
@@ -266,9 +284,13 @@ async def run(discovery: bool) -> None:
     from aiogram import Bot, Dispatcher, Router
     from aiogram.exceptions import TelegramAPIError
     from aiogram.types import Message
+    from aiogram.utils.token import TokenValidationError
 
     config = Config.from_env(discovery=discovery)
-    bot = Bot(config.token)
+    try:
+        bot = Bot(config.token)
+    except TokenValidationError as exc:
+        raise RuntimeError("invalid Telegram token format") from exc
     try:
         try:
             me = await bot.get_me()

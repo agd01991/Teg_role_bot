@@ -23,7 +23,7 @@ from aiogram.types import (
 )
 
 from telegram_probe.config import Config
-from telegram_probe.core import Person
+from telegram_probe.core import Entity, Person
 from telegram_probe.live import (
     FrameworkLogFilter,
     assignment_command,
@@ -31,6 +31,8 @@ from telegram_probe.live import (
     is_actual_member,
     run,
 )
+
+_AUTO_ENTITIES = object()
 
 
 class Session(BaseSession):
@@ -130,11 +132,24 @@ def message(
     sender=1,
     *,
     reply=None,
-    entities=None,
+    entities=_AUTO_ENTITIES,
     forward=False,
     message_id=10,
     sender_is_bot=False,
 ):
+    if entities is _AUTO_ENTITIES:
+        stripped = text.strip() if text else ""
+        if stripped.casefold().startswith("/probe_assign"):
+            leading = len(text) - len(text.lstrip())
+            entities = [
+                MessageEntity(
+                    type="bot_command",
+                    offset=len(text[:leading].encode("utf-16-le")) // 2,
+                    length=len(stripped.encode("utf-16-le")) // 2,
+                )
+            ]
+        else:
+            entities = None
     data = dict(
         message_id=message_id,
         date=0,
@@ -191,6 +206,53 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
         await self.feed(message("/probe_assign@OtherBot", reply=target3), 3)
         self.assertNotIn(4, self.probe.assignments[-100])
 
+    async def test_assignment_requires_exact_unquoted_bot_command_entity(self):
+        target = message("hello", sender=2)
+        cases = (
+            message("/probe_assign", reply=target, entities=None, message_id=20),
+            message(
+                "/probe_assign",
+                reply=target,
+                entities=[MessageEntity(type="bot_command", offset=1, length=12)],
+                message_id=21,
+            ),
+            message(
+                "/probe_assign",
+                reply=target,
+                entities=[
+                    MessageEntity(type="bot_command", offset=0, length=13),
+                    MessageEntity(type="code", offset=0, length=13),
+                ],
+                message_id=22,
+            ),
+        )
+        for update_id, invalid in enumerate(cases, 20):
+            await self.feed(invalid, update_id)
+        self.assertNotIn(2, self.probe.assignments.get(-100, {}))
+        self.assertFalse(
+            any(isinstance(call, GetChatMember) for call in self.session.calls)
+        )
+
+    async def test_assignment_rejects_all_quoted_entity_types(self):
+        for update_id, kind in enumerate(
+            ("pre", "blockquote", "expandable_blockquote"), 30
+        ):
+            target = message("hello", sender=update_id)
+            entities = [
+                MessageEntity(type="bot_command", offset=0, length=13),
+                MessageEntity(type=kind, offset=0, length=13),
+            ]
+            await self.feed(
+                message(
+                    "/probe_assign",
+                    reply=target,
+                    entities=entities,
+                    message_id=update_id,
+                ),
+                update_id,
+            )
+            self.assertNotIn(update_id, self.probe.assignments.get(-100, {}))
+
     async def test_owner_and_administrator_from_json_can_assign(self):
         target = message("hello", sender=2, message_id=9)
         await self.feed(message("/probe_assign", reply=target), 1)
@@ -233,6 +295,39 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
         self.session.make_request = failing
         await self.feed(message("/probe_assign", reply=target), 2)
         self.assertNotIn(2, self.probe.assignments.get(-100, {}))
+
+    async def test_all_confirmed_absent_states_remove_assignments(self):
+        absent_members = {
+            2: parsed_member({"status": "left", "user": user(2).model_dump()}),
+            3: parsed_member(
+                {
+                    "status": "kicked",
+                    "user": user(3).model_dump(),
+                    "until_date": 0,
+                }
+            ),
+            4: restricted_member(4, False),
+        }
+        for update_id, (user_id, absent_member) in enumerate(
+            absent_members.items(), 60
+        ):
+            with self.subTest(status=absent_member.status):
+                self.probe.assign(-100, 1, Person(user_id, f"User {user_id}"))
+                self.session.members[user_id] = absent_member
+                await self.feed(
+                    message(
+                        "/probe_assign",
+                        reply=message("hello", sender=user_id),
+                        message_id=update_id,
+                    ),
+                    update_id,
+                )
+                self.assertNotIn(user_id, self.probe.assignments[-100])
+                self.assertIn(user_id, self.probe.departed[-100])
+        sent = [
+            call.text for call in self.session.calls if isinstance(call, SendMessage)
+        ]
+        self.assertFalse(any("сохранено" in text for text in sent))
 
     async def test_forwarded_command_and_target_are_rejected(self):
         target = message("hello", sender=2)
@@ -278,12 +373,14 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
         task = asyncio.create_task(
             self.feed(message("/probe_assign", reply=message("hello", sender=2)))
         )
-        await waiting.wait()
-        self.session.members[1] = parsed_member(
-            {"status": "member", "user": user(1).model_dump()}
-        )
-        release.set()
-        await task
+        try:
+            await asyncio.wait_for(waiting.wait(), timeout=1)
+            self.session.members[1] = parsed_member(
+                {"status": "member", "user": user(1).model_dump()}
+            )
+        finally:
+            release.set()
+            await asyncio.wait_for(task, timeout=1)
         self.assertNotIn(2, self.probe.assignments.get(-100, {}))
         sent = [
             call.text for call in self.session.calls if isinstance(call, SendMessage)
@@ -329,13 +426,18 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
         task = asyncio.create_task(
             self.feed(message("/probe_assign", reply=message("hello", sender=2)))
         )
-        await waiting.wait()
-        for update_id, event in enumerate(events, 100):
-            await self.dp.feed_update(
-                self.bot, Update(update_id=update_id, chat_member=event)
-            )
-        release.set()
-        await task
+        try:
+            await asyncio.wait_for(waiting.wait(), timeout=1)
+            for update_id, event in enumerate(events, 100):
+                await asyncio.wait_for(
+                    self.dp.feed_update(
+                        self.bot, Update(update_id=update_id, chat_member=event)
+                    ),
+                    timeout=1,
+                )
+        finally:
+            release.set()
+            await asyncio.wait_for(task, timeout=1)
         return [
             call.text for call in self.session.calls if isinstance(call, SendMessage)
         ]
@@ -372,6 +474,90 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
         sent = await self._assign_while_final_check_waits([unrelated, other_chat])
         self.assertIn(2, self.probe.assignments[-100])
         self.assertTrue(any("сохранено" in text for text in sent))
+
+    async def test_role_check_absence_invalidates_parallel_assignment(self):
+        self.probe.assign(-100, 1, Person(2, "Recipient"))
+        final_check_waiting = asyncio.Event()
+        release_final_check = asyncio.Event()
+        operator_checks = 0
+
+        async def hook(method):
+            nonlocal operator_checks
+            if isinstance(method, GetChatMember) and method.user_id == 1:
+                operator_checks += 1
+                if operator_checks == 2:
+                    final_check_waiting.set()
+                    await release_final_check.wait()
+
+        self.session.request_hook = hook
+        assignment = asyncio.create_task(
+            self.feed(
+                message(
+                    "/probe_assign", reply=message("hello", sender=2), message_id=40
+                ),
+                40,
+            )
+        )
+        try:
+            await asyncio.wait_for(final_check_waiting.wait(), timeout=1)
+            self.session.members[2] = ChatMemberLeft(user=user(2))
+            invoke = message(
+                "@ActualBot #probe",
+                sender=9,
+                entities=[MessageEntity(type="mention", offset=0, length=10)],
+                message_id=41,
+            )
+            await asyncio.wait_for(self.feed(invoke, 41), timeout=1)
+        finally:
+            release_final_check.set()
+            await asyncio.wait_for(assignment, timeout=1)
+
+        self.assertNotIn(2, self.probe.assignments.get(-100, {}))
+        self.assertIn(2, self.probe.departed[-100])
+        sent = [
+            call.text for call in self.session.calls if isinstance(call, SendMessage)
+        ]
+        self.assertFalse(any("сохранено" in text for text in sent))
+
+    async def test_assignment_target_absence_invalidates_stale_command(self):
+        waiting, release = asyncio.Event(), asyncio.Event()
+        target_checks = 0
+
+        async def hook(method):
+            nonlocal target_checks
+            if isinstance(method, GetChatMember) and method.user_id == 2:
+                target_checks += 1
+                if target_checks == 1:
+                    waiting.set()
+                    await release.wait()
+
+        self.session.request_hook = hook
+        first = asyncio.create_task(
+            self.feed(message("/probe_assign", reply=message("hello", sender=2)), 50)
+        )
+        try:
+            await asyncio.wait_for(waiting.wait(), timeout=1)
+            self.session.members[2] = ChatMemberLeft(user=user(2))
+            await asyncio.wait_for(
+                self.feed(
+                    message(
+                        "/probe_assign",
+                        reply=message("hello", sender=2),
+                        message_id=51,
+                    ),
+                    51,
+                ),
+                timeout=1,
+            )
+        finally:
+            release.set()
+            await asyncio.wait_for(first, timeout=1)
+        self.assertNotIn(2, self.probe.assignments.get(-100, {}))
+        self.assertIn(2, self.probe.departed[-100])
+        sent = [
+            call.text for call in self.session.calls if isinstance(call, SendMessage)
+        ]
+        self.assertFalse(any("сохранено" in text for text in sent))
 
     async def test_restricted_events_and_return_do_not_restore(self):
         self.probe.assign(-100, 1, Person(2, "Recipient"))
@@ -467,9 +653,16 @@ class MembershipAndSafetyTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(is_actual_member(member))
 
     def test_command_parser(self):
-        self.assertTrue(assignment_command("/probe_assign", "ActualBot"))
-        self.assertTrue(assignment_command("/probe_assign@actualbot", "ActualBot"))
-        self.assertFalse(assignment_command("/probe_assign@OtherBot", "ActualBot"))
+        plain = (Entity("bot_command", 0, 13),)
+        addressed = (Entity("bot_command", 0, 23),)
+        self.assertTrue(assignment_command("/probe_assign", "ActualBot", plain))
+        self.assertTrue(
+            assignment_command("/probe_assign@actualbot", "ActualBot", addressed)
+        )
+        self.assertFalse(
+            assignment_command("/probe_assign@OtherBot", "ActualBot", addressed)
+        )
+        self.assertFalse(assignment_command("/probe_assign", "ActualBot"))
 
     def test_framework_exception_log_is_redacted(self):
         marker = "PRIVATE_MESSAGE_MARKER"
@@ -541,6 +734,18 @@ class MembershipAndSafetyTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(RuntimeError):
                 await run(False)
         fake_bot.session.close.assert_awaited_once()
+
+    async def test_invalid_token_format_is_safe_and_needs_no_cleanup(self):
+        config = Config("not-a-token", frozenset(), frozenset(), 2, 0)
+        for discovery in (False, True):
+            with self.subTest(discovery=discovery):
+                with patch(
+                    "telegram_probe.config.Config.from_env", return_value=config
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "invalid Telegram token format"
+                    ):
+                        await run(discovery)
 
 
 if __name__ == "__main__":
