@@ -167,8 +167,12 @@ def build_router(bot: Any, config: Config, me: Any):
             operator_membership_revision = probe.membership_revision(
                 *operator_membership_key
             )
+            operator_authorization_revision = probe.authorization_revision(
+                *operator_membership_key
+            )
             membership_key = (message.chat.id, target.id)
             membership_revision = probe.membership_revision(*membership_key)
+            operator_check = probe.begin_authorization_check(*operator_membership_key)
             try:
                 operator = await bot.get_chat_member(message.chat.id, sender.id)
             except Exception as exc:
@@ -178,7 +182,13 @@ def build_router(bot: Any, config: Config, me: Any):
                     message.chat.id,
                 )
                 return
-            if sender.id not in config.operators or not is_chat_administrator(operator):
+            operator_authorized = (
+                sender.id in config.operators and is_chat_administrator(operator)
+            )
+            probe.observe_authorization(
+                *operator_membership_key, operator_check, operator_authorized
+            )
+            if not operator_authorized:
                 await message.reply(
                     "Назначение отклонено: нужны права администратора Telegram."
                 )
@@ -201,6 +211,9 @@ def build_router(bot: Any, config: Config, me: Any):
                     "Назначение отклонено: участник сейчас отсутствует в чате."
                 )
                 return
+            final_operator_check = probe.begin_authorization_check(
+                *operator_membership_key
+            )
             try:
                 current_operator = await bot.get_chat_member(message.chat.id, sender.id)
             except Exception as exc:
@@ -212,9 +225,16 @@ def build_router(bot: Any, config: Config, me: Any):
                     message.message_id,
                 )
                 return
-            if sender.id not in config.operators or not is_chat_administrator(
-                current_operator
-            ):
+            operator_authorized = (
+                sender.id in config.operators
+                and is_chat_administrator(current_operator)
+            )
+            probe.observe_authorization(
+                *operator_membership_key,
+                final_operator_check,
+                operator_authorized,
+            )
+            if not operator_authorized:
                 await message.reply("Назначение отклонено: права оператора изменились.")
                 return
             if (
@@ -224,6 +244,12 @@ def build_router(bot: Any, config: Config, me: Any):
                 await message.reply(
                     "Назначение отклонено: членство оператора изменилось."
                 )
+                return
+            if (
+                probe.authorization_revision(*operator_membership_key)
+                != operator_authorization_revision
+            ):
+                await message.reply("Назначение отклонено: права оператора изменились.")
                 return
             if probe.membership_revision(*membership_key) != membership_revision:
                 await message.reply(
@@ -272,6 +298,9 @@ def build_router(bot: Any, config: Config, me: Any):
         user_id = member.user.id
         present = is_actual_member(member)
         was_present = is_actual_member(event.old_chat_member)
+        authorized = is_chat_administrator(member)
+        if authorized != is_chat_administrator(event.old_chat_member):
+            probe.authorization_changed(event.chat.id, user_id, authorized)
         if not present:
             probe.leave(event.chat.id, user_id)
             action = "deactivated"

@@ -49,7 +49,9 @@ class Session(BaseSession):
     async def make_request(self, bot, method, timeout=None):
         self.calls.append(method)
         if self.request_hook:
-            await self.request_hook(method)
+            response = await self.request_hook(method)
+            if response is not None:
+                return response
         if isinstance(method, GetChatMember):
             return self.members.get(
                 method.user_id,
@@ -473,6 +475,119 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
         sent = await self._assign_while_final_check_waits([left])
         self.assertNotIn(2, self.probe.assignments.get(-100, {}))
         self.assertFalse(any("сохранено" in text for text in sent))
+
+    async def test_operator_downgrade_events_deny_stale_final_admin_response(self):
+        old = parsed_administrator(1)
+        for update_id, downgraded in enumerate(
+            (ChatMemberMember(user=user(1)), restricted_member(1, True)), 110
+        ):
+            with self.subTest(status=downgraded.status):
+                self.session.calls.clear()
+                self.probe.assignments.clear()
+                event = membership_event(1, old, downgraded)
+                sent = await self._assign_while_final_check_waits([event])
+                self.assertNotIn(2, self.probe.assignments.get(-100, {}))
+                self.assertFalse(any("сохранено" in text for text in sent))
+
+    async def test_operator_revoke_and_restore_invalidates_old_command(self):
+        administrator = parsed_administrator(1)
+        member = ChatMemberMember(user=user(1))
+        sent = await self._assign_while_final_check_waits(
+            [
+                membership_event(1, administrator, member),
+                membership_event(1, member, administrator),
+            ]
+        )
+        self.assertNotIn(2, self.probe.assignments.get(-100, {}))
+        self.assertFalse(any("сохранено" in text for text in sent))
+
+        self.session.request_hook = None
+        self.session.members[1] = administrator
+        await self.feed(
+            message("/probe_assign", reply=message("hello", sender=2), message_id=112),
+            112,
+        )
+        self.assertIn(2, self.probe.assignments[-100])
+
+    async def test_admin_downgrade_keeps_existing_recipient_assignment(self):
+        self.probe.assign(-100, 1, Person(1, "Operator as recipient"))
+        await self.dp.feed_update(
+            self.bot,
+            Update(
+                update_id=113,
+                chat_member=membership_event(
+                    1, parsed_administrator(1), ChatMemberMember(user=user(1))
+                ),
+            ),
+        )
+        self.assertIn(1, self.probe.assignments[-100])
+
+    async def test_unrelated_rights_changes_do_not_block_assignment(self):
+        administrator = parsed_administrator(3)
+        events = [
+            membership_event(3, administrator, ChatMemberMember(user=user(3))),
+            membership_event(
+                1,
+                parsed_administrator(1),
+                ChatMemberMember(user=user(1)),
+                chat_id=-200,
+            ),
+        ]
+        sent = await self._assign_while_final_check_waits(events)
+        self.assertIn(2, self.probe.assignments[-100])
+        self.assertTrue(any("сохранено" in text for text in sent))
+
+    async def _parallel_negative_operator_check(self, negative_at_final):
+        waiting, release = asyncio.Event(), asyncio.Event()
+        administrator = parsed_administrator(1)
+        regular = ChatMemberMember(user=user(1))
+        operator_checks = 0
+
+        async def hook(method):
+            nonlocal operator_checks
+            if not isinstance(method, GetChatMember) or method.user_id != 1:
+                return None
+            operator_checks += 1
+            if operator_checks == 2:
+                waiting.set()
+                await release.wait()
+                return administrator
+            if operator_checks == (4 if negative_at_final else 3):
+                return regular
+            return administrator
+
+        self.session.request_hook = hook
+        stale = asyncio.create_task(
+            self.feed(
+                message("/probe_assign", reply=message("A", sender=2), message_id=120),
+                120,
+            )
+        )
+        try:
+            await asyncio.wait_for(waiting.wait(), timeout=1)
+            await asyncio.wait_for(
+                self.feed(
+                    message(
+                        "/probe_assign", reply=message("B", sender=3), message_id=121
+                    ),
+                    121,
+                ),
+                timeout=1,
+            )
+        finally:
+            release.set()
+            await asyncio.wait_for(stale, timeout=1)
+        sent = [
+            call.text for call in self.session.calls if isinstance(call, SendMessage)
+        ]
+        self.assertNotIn(2, self.probe.assignments.get(-100, {}))
+        self.assertFalse(any("сохранено" in text for text in sent))
+
+    async def test_parallel_negative_first_check_invalidates_stale_command(self):
+        await self._parallel_negative_operator_check(False)
+
+    async def test_parallel_negative_final_check_invalidates_stale_command(self):
+        await self._parallel_negative_operator_check(True)
 
     async def test_target_leaves_and_returns_during_final_operator_check(self):
         left = membership_event(
