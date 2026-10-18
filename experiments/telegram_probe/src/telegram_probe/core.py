@@ -102,6 +102,9 @@ class Probe:
     processed: set[tuple[int, int]] = field(default_factory=set)
     outcomes: dict[tuple[int, int], str] = field(default_factory=dict)
     membership_revisions: dict[tuple[int, int], int] = field(default_factory=dict)
+    authorization_revisions: dict[tuple[int, int], int] = field(default_factory=dict)
+    authorization_checks: dict[tuple[int, int], int] = field(default_factory=dict)
+    authorization_revocations: dict[tuple[int, int], int] = field(default_factory=dict)
 
     def assign(self, chat_id: int, operator_id: int, person: Person) -> None:
         self._authorize(chat_id, operator_id)
@@ -124,9 +127,45 @@ class Probe:
     def membership_revision(self, chat_id: int, user_id: int) -> int:
         return self.membership_revisions.get((chat_id, user_id), 0)
 
+    def authorization_revision(self, chat_id: int, user_id: int) -> int:
+        return self.authorization_revisions.get((chat_id, user_id), 0)
+
+    def begin_authorization_check(self, chat_id: int, user_id: int) -> int:
+        key = (chat_id, user_id)
+        check = self.authorization_checks.get(key, 0) + 1
+        self.authorization_checks[key] = check
+        return check
+
+    def observe_authorization(
+        self, chat_id: int, user_id: int, check: int, authorized: bool
+    ) -> None:
+        """Record ordered API evidence without letting a stale success restore rights."""
+        key = (chat_id, user_id)
+        revoked_at = self.authorization_revocations.get(key)
+        if not authorized:
+            self.authorization_revocations[key] = max(check, revoked_at or check)
+            self._advance_authorization(chat_id, user_id)
+        elif revoked_at is not None and check > revoked_at:
+            self.authorization_revocations.pop(key, None)
+
+    def authorization_changed(
+        self, chat_id: int, user_id: int, authorized: bool
+    ) -> None:
+        """Invalidate in-flight work after an observed Telegram rights transition."""
+        key = (chat_id, user_id)
+        if authorized:
+            self.authorization_revocations.pop(key, None)
+        else:
+            self.authorization_revocations[key] = self.authorization_checks.get(key, 0)
+        self._advance_authorization(chat_id, user_id)
+
     def _advance_membership(self, chat_id: int, user_id: int) -> None:
         key = (chat_id, user_id)
         self.membership_revisions[key] = self.membership_revisions.get(key, 0) + 1
+
+    def _advance_authorization(self, chat_id: int, user_id: int) -> None:
+        key = (chat_id, user_id)
+        self.authorization_revisions[key] = self.authorization_revisions.get(key, 0) + 1
 
     async def invoke(
         self,
