@@ -31,3 +31,23 @@
 - PostgreSQL остаётся целью пилота; DATA_MODEL — логическая модель, не утверждённые DDL/миграции.
 
 RES-001 остаётся незавершённым до реальных испытаний по [протоколу](research/RES-001.md). Следующий инженерный этап после исследования — OPS-001; DOC-003 не меняет эту последовательность и не засчитывает probe как продуктовую приёмку.
+
+## Проверка PR #10 от 20 октября 2026 года
+
+GitHub и `fetch origin` подтвердили открытый PR #10: `m4plkv-codex/-res-001` (`13603e526117d65be14bac887df1554024939125`) → `codex` (`333387ea74b6a73ff0d1ba7352d94fc3d28c0632`). Исправление старого замечания об отзыве прав уже включено PR #11 и подтверждено текущими регрессиями. CI у родительского PR отсутствует. От актуального head создана отдельная ветка `fix/pr-10-probe-checks`, исправления направляются обратно в ветку PR #10; автоматического слияния нет. Замечания документации PR #9 исправляются отдельно в [PR #12](https://github.com/agd01991/Teg_role_bot/pull/12).
+
+На исходном head Ruff 0.17.1 сообщил 18 замечаний. Исправлены импорты, устаревшая аннотация, построение словарей в фикстурах и вложенные контекстные менеджеры; `live` использует собственный logger. Пять широких перехватов на границах транспорта оставлены с точечным объяснением `BLE001`: они обеспечивают безопасный отказ при неизвестной ошибке без текста исключения/traceback. Авторизация и поведение отправки сохранены.
+
+В отдельном локальном окружении CPython 3.12.14 установлены runtime-зависимости из `requirements.lock`, включая aiogram 3.22.0, Black 26.10.1 и Ruff 0.17.1. Выполнены точные команды из корня:
+
+```powershell
+$env:PYTHONPATH = [IO.Path]::GetFullPath('experiments/telegram_probe/src')
+.\.venv\Scripts\python.exe -m unittest discover -s experiments/telegram_probe/tests -v
+.\.venv\Scripts\python.exe -m black --check experiments/telegram_probe/src experiments/telegram_probe/tests
+.\.venv\Scripts\python.exe -m ruff check experiments/telegram_probe/src experiments/telegram_probe/tests
+.\.venv\Scripts\python.exe -m compileall -q experiments/telegram_probe/src experiments/telegram_probe/tests
+.\.venv\Scripts\python.exe -m pip check
+git --git-dir=.git --work-tree=. diff --check
+```
+
+Результат: **47 тестов OK**, в том числе понижение оператора, отзыв/повторная выдача, параллельный отрицательный API-ответ, защита членства и отсутствие секретов в логах; Black проверил все 6 файлов; полный набор Ruff — без замечаний; синтаксис, зависимости и diff — без ошибок. Настоящий Telegram, уведомления Android/iOS/Desktop и продуктовая приёмка не выполнялись: нет тестового бота, чатов и устройств. RES-001 остаётся открытым.

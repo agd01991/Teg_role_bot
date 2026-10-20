@@ -11,9 +11,9 @@ from aiogram.methods import GetChatMember, SendMessage
 from aiogram.types import (
     Chat,
     ChatMemberAdministrator,
-    ChatMemberOwner,
     ChatMemberLeft,
     ChatMemberMember,
+    ChatMemberOwner,
     ChatMemberRestricted,
     ChatMemberUpdated,
     Message,
@@ -21,7 +21,6 @@ from aiogram.types import (
     Update,
     User,
 )
-
 from telegram_probe.config import Config
 from telegram_probe.core import Entity, Person
 from telegram_probe.live import (
@@ -152,15 +151,15 @@ def message(
             ]
         else:
             entities = None
-    data = dict(
-        message_id=message_id,
-        date=0,
-        chat=Chat(id=-100, type="supergroup", title="Test"),
-        from_user=user(sender, bot=sender_is_bot),
-        text=text,
-        entities=entities,
-        reply_to_message=reply,
-    )
+    data = {
+        "message_id": message_id,
+        "date": 0,
+        "chat": Chat(id=-100, type="supergroup", title="Test"),
+        "from_user": user(sender, bot=sender_is_bot),
+        "text": text,
+        "entities": entities,
+        "reply_to_message": reply,
+    }
     if forward:
         data["forward_origin"] = {
             "type": "user",
@@ -700,11 +699,11 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_restricted_events_and_return_do_not_restore(self):
         self.probe.assign(-100, 1, Person(2, "Recipient"))
-        common = dict(
-            chat=Chat(id=-100, type="supergroup", title="Test"),
-            from_user=user(1),
-            date=0,
-        )
+        common = {
+            "chat": Chat(id=-100, type="supergroup", title="Test"),
+            "from_user": user(1),
+            "date": 0,
+        }
         restricted = restricted_member(2, True)
         event = ChatMemberUpdated(
             **common,
@@ -869,22 +868,18 @@ class MembershipAndSafetyTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch("telegram_probe.config.Config.from_env", return_value=config),
             patch("aiogram.Bot", return_value=fake_bot),
+            self.assertRaises(RuntimeError),
         ):
-            with self.assertRaises(RuntimeError):
-                await run(False)
+            await run(False)
         fake_bot.session.close.assert_awaited_once()
 
     async def test_invalid_token_format_is_safe_and_needs_no_cleanup(self):
         config = Config("not-a-token", frozenset(), frozenset(), 2, 0)
         for discovery in (False, True):
-            with self.subTest(discovery=discovery):
-                with patch(
-                    "telegram_probe.config.Config.from_env", return_value=config
-                ):
-                    with self.assertRaisesRegex(
-                        RuntimeError, "invalid Telegram token format"
-                    ):
-                        await run(discovery)
+            with self.subTest(discovery=discovery), patch(
+                "telegram_probe.config.Config.from_env", return_value=config
+            ), self.assertRaisesRegex(RuntimeError, "invalid Telegram token format"):
+                await run(discovery)
 
 
 if __name__ == "__main__":

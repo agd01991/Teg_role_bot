@@ -30,6 +30,19 @@ python -m unittest discover -s experiments\telegram_probe\tests -v
 
 Тесты не читают токен и не обращаются в сеть. `requirements.lock` фиксирует runtime-зависимости, включая транзитивные; это не выбор стека будущего приложения.
 
+### Проверки стиля
+
+В том же Python 3.12 окружении из корня репозитория:
+
+```bash
+python -m pip install black==26.10.1 ruff==0.17.1
+python -m black --check experiments/telegram_probe/src experiments/telegram_probe/tests
+python -m ruff check experiments/telegram_probe/src experiments/telegram_probe/tests
+python -m pip check
+```
+
+Версии инструментов закреплены для воспроизводимости проверенного набора правил. Точечные исключения `BLE001` отмечают границы недоверенного транспорта: неизвестная ошибка должна давать отказ, а диагностика содержит только её тип. Замена на печать traceback или полного ответа API может раскрыть секреты.
+
 ## Безопасная настройка и получение ID
 
 1. Создайте отдельного тестового бота через BotFather и добавьте его только в тестовый чат. Токен не публикуйте.

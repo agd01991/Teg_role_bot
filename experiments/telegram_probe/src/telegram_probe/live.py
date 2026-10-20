@@ -10,6 +10,7 @@ from .config import Config
 from .core import Entity, Invocation, Person, Probe
 
 _MEMBER_STATUSES = {"creator", "administrator", "member"}
+logger = logging.getLogger(__name__)
 
 
 def _enum_value(value: Any) -> str:
@@ -175,8 +176,8 @@ def build_router(bot: Any, config: Config, me: Any):
             operator_check = probe.begin_authorization_check(*operator_membership_key)
             try:
                 operator = await bot.get_chat_member(message.chat.id, sender.id)
-            except Exception as exc:
-                logging.error(
+            except Exception as exc:  # noqa: BLE001 - deny without logging API secrets
+                logger.error(
                     "operator_check_failed error_type=%s chat_id=%s",
                     type(exc).__name__,
                     message.chat.id,
@@ -195,8 +196,8 @@ def build_router(bot: Any, config: Config, me: Any):
                 return
             try:
                 target_present = await member_check(message.chat.id, target.id)
-            except Exception as exc:
-                logging.error(
+            except Exception as exc:  # noqa: BLE001 - deny without logging API secrets
+                logger.error(
                     "target_member_check_failed error_type=%s outcome=denied "
                     "chat_id=%s user_id=%s update_key=%s",
                     type(exc).__name__,
@@ -216,8 +217,8 @@ def build_router(bot: Any, config: Config, me: Any):
             )
             try:
                 current_operator = await bot.get_chat_member(message.chat.id, sender.id)
-            except Exception as exc:
-                logging.error(
+            except Exception as exc:  # noqa: BLE001 - deny without logging API secrets
+                logger.error(
                     "final_operator_check_failed error_type=%s outcome=denied "
                     "chat_id=%s update_key=%s",
                     type(exc).__name__,
@@ -283,7 +284,7 @@ def build_router(bot: Any, config: Config, me: Any):
         outcome = await probe.invoke(
             invocation, me.username, LiveTransport(), member_check
         )
-        logging.info(
+        logger.info(
             "probe outcome=%s chat_id=%s update_key=%s",
             outcome,
             message.chat.id,
@@ -309,7 +310,7 @@ def build_router(bot: Any, config: Config, me: Any):
             action = "assignment_not_restored"
         else:
             action = "kept"
-        logging.info(
+        logger.info(
             "membership_event chat_id=%s user_id=%s status=%s is_member=%s action=%s",
             event.chat.id,
             user_id,

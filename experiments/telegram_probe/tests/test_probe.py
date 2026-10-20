@@ -1,5 +1,5 @@
-import unittest
 import logging
+import unittest
 
 from telegram_probe.core import Entity, Invocation, Person, Probe, mention, parse_probe
 
