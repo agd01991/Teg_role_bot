@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from html import escape
-from typing import Awaitable, Callable, Protocol
+from typing import Protocol
 
 
 @dataclass(frozen=True)
@@ -204,7 +205,7 @@ class Probe:
                     continue
                 try:
                     is_member = await member_check(invocation.chat_id, person.user_id)
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 - deny unknown adapter failures
                     prefix = "partially_sent_" if sent_parts else ""
                     outcome = f"{prefix}member_check_failed"
                     self._log_failure("member_check", exc, outcome, key, person.user_id)
@@ -236,7 +237,7 @@ class Probe:
                 outcome = f"{prefix}uncertain"
                 self._log_failure("send", exc, outcome, key)
                 return self._finish(key, outcome)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - preserve safe send diagnostics
                 prefix = "partially_sent_" if sent_parts else ""
                 outcome = f"{prefix}send_failed"
                 self._log_failure("send", exc, outcome, key)

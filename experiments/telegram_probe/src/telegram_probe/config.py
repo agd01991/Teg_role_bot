@@ -33,7 +33,7 @@ class Config:
     delay: float
 
     @classmethod
-    def from_env(cls, *, discovery: bool = False) -> "Config":
+    def from_env(cls, *, discovery: bool = False) -> Config:
         load_dotenv()
         token = os.getenv("TELEGRAM_BOT_TOKEN", "")
         if not token or token == "replace-locally":
