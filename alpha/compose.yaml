@@ -1,0 +1,25 @@
+name: rolebot-test-alpha
+services:
+  db:
+    image: postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
+    environment:
+      POSTGRES_DB: rolealpha
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+    secrets:
+      - db_password
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - alpha_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d rolealpha"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+secrets:
+  db_password:
+    file: ../.alpha/db-password
+volumes:
+  alpha_db:

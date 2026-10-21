@@ -1,0 +1,65 @@
+name: Alpha checks
+on:
+  pull_request:
+  push:
+    branches:
+      - feat/telegram-test-alpha
+permissions:
+  contents: read
+concurrency:
+  group: alpha-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  alpha:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
+        env:
+          POSTGRES_PASSWORD: ci-only-password
+          POSTGRES_DB: rolealpha_tests
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    env:
+      ALPHA_TEST_DATABASE_URL: postgresql://roleapp:ci-only-app@127.0.0.1:5432/rolealpha_tests
+      PGPASSWORD: ci-only-password
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -r alpha/requirements.lock black==26.10.1 ruff==0.17.1
+      - name: Restrict test database role
+        run: |
+          psql -h 127.0.0.1 -U postgres -d rolealpha_tests -v ON_ERROR_STOP=1 -c "CREATE ROLE roleapp LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION PASSWORD 'ci-only-app';"
+          psql -h 127.0.0.1 -U postgres -d rolealpha_tests -v ON_ERROR_STOP=1 -c "ALTER DATABASE rolealpha_tests OWNER TO roleapp; REVOKE ALL ON DATABASE rolealpha_tests FROM PUBLIC; REVOKE CREATE ON SCHEMA public FROM PUBLIC;"
+      - run: python alpha/check.py
+      - run: python -m black --check alpha
+      - run: python -m ruff check alpha
+      - run: python -m compileall -q alpha
+      - run: python -m pip check
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -r experiments/telegram_probe/requirements.lock black==26.10.1 ruff==0.17.1
+      - run: python -m unittest discover -s experiments/telegram_probe/tests -v
+        env:
+          PYTHONPATH: experiments/telegram_probe/src
+      - run: python -m black --check experiments/telegram_probe/src experiments/telegram_probe/tests
+      - run: python -m ruff check experiments/telegram_probe/src experiments/telegram_probe/tests
+      - run: python -m pip check
